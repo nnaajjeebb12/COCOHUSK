@@ -1,0 +1,67 @@
+name: husktech
+description: >
+  HuskTech is a mobile-based application designed to automatically assess and
+  classify the maturity of coconut husks using image recognition and machine
+  learning technology. The application analyzes whether coconut husks are
+  immature, mature, or overmature to determine the appropriate maturity grade.
+  By replacing traditional manual inspection methods, HuskTech aims to reduce
+  subjectivity and improve grading consistency.
+
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Image picker for camera/gallery (still-image capture fallback)
+  image_picker: ^1.0.7
+
+  # Live camera preview for in-app continuous prediction
+  camera: ^0.11.0
+
+  # TensorFlow Lite Flutter
+  tflite_flutter: ^0.12.0
+
+  # HTTP client
+  http: ^1.1.0
+
+  # For local paths (app documents directory)
+  path_provider: ^2.1.2
+
+  # For storing model version, etc.
+  shared_preferences: ^2.2.2
+
+  # File picker for selecting custom .tflite model files from device storage.
+  file_picker: ^8.1.4
+
+  # Structured logging for diagnostics across the app.
+  logger: ^2.4.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.4
+  image: ^4.9.2
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/model/coconut_husk_quality_model.tflite
+    - assets/model/class_names.txt
+    - assets/model/rejection_config.json
+    - huskpng.png
+
+# Android launcher icon is generated from huskpng.png by `dart run
+# flutter_launcher_icons`. Windows is handled separately, by
+# tool/gen_windows_icon.dart: this package's Windows generator only ever
+# emits a single-size .ico, which is the same "crops the corner instead of
+# scaling" problem the original hand-made huskicon.ico had.
+flutter_launcher_icons:
+  android: 'ic_launcher'
+  image_path: 'huskpng.png'
+  min_sdk_android: 21

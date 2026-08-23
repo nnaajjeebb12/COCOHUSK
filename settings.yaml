@@ -1,0 +1,6 @@
+client_config_file: "credentials.json"
+save_credentials: true
+save_credentials_file: "token.json"
+save_credentials_backend: "file"
+oauth_scope:
+  - "https://www.googleapis.com/auth/drive.file"
