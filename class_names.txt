@@ -1,4 +1,0 @@
-grade_A
-grade_B
-grade_C
-reject
