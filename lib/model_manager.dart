@@ -14,6 +14,13 @@ enum ModelUpdateStatus {
   failed,
 }
 
+/// Reports load/download progress so the UI can show something more useful
+/// than a static "Loading model..." message. [fraction] is 0.0-1.0 when
+/// progress is actually measurable (a download with a known content length),
+/// or null for an indeterminate phase (checking for updates, saving to
+/// disk, verifying, etc).
+typedef ModelLoadProgress = void Function(String phase, {double? fraction});
+
 /// Where the currently active model came from.
 enum ModelSource {
   bundled,
@@ -23,13 +30,13 @@ enum ModelSource {
 }
 
 class ModelManager {
-  // model_meta.json, hosted on Google Drive by the client. Points at
-  // model_url/labels_url/rejection_url, which in turn point at the actual
-  // .tflite/class_names.txt/rejection_config.json files (verified 2026-08-23
-  // to resolve to the same model/labels/rejection config already bundled
-  // as the app's default).
+  // model_meta.json, hosted in the husktechrepo/cocohusk GitHub repo (a
+  // dedicated storage repo, not app source). Points at model_url/labels_url/
+  // rejection_url, which are GitHub Release assets in the same repo
+  // (verified 2026-08-26 to resolve to the same model/labels/rejection
+  // config already bundled as the app's default).
   static const String _metaUrl =
-      'https://drive.google.com/uc?export=download&id=1egap7mATjXnIzTTA6Bar70iL-elnYtGD';
+      'https://raw.githubusercontent.com/husktechrepo/cocohusk/main/model_meta.json';
 
   static const String _localModelName = 'coconut_husk_quality_model.tflite';
   static const String _localLabelsName = 'class_names.txt';
@@ -59,9 +66,15 @@ class ModelManager {
     return File('${dir.path}/$_localRejectionCfgName');
   }
 
+  // True only when the local cache is actually complete enough to be used:
+  // both the model and its labels file must be present, since
+  // readActiveModelBytes's "local" branch reads both. rejection_config.json
+  // isn't required here — readLocalRejectionConfig already falls back to
+  // the bundled one gracefully if it's missing.
   static Future<bool> hasLocalModel() async {
-    final file = await _localModelFile();
-    return file.exists();
+    final modelExists = await (await _localModelFile()).exists();
+    final labelsExist = await (await _localLabelsFile()).exists();
+    return modelExists && labelsExist;
   }
 
   static Future<Uint8List> readLocalModelBytes() async {
@@ -195,8 +208,56 @@ class ModelManager {
     return (bytes: bytes, source: ModelSource.bundled, path: null);
   }
 
-  static Future<ModelUpdateStatus> checkAndUpdateModel() async {
+  /// Downloads [url] via a streamed request instead of a single-shot
+  /// `http.get`, reporting byte-level progress through [onProgress] as it
+  /// goes (when the server sends a Content-Length header; otherwise progress
+  /// stays indeterminate). Used for the model file specifically, since that's
+  /// the one large enough (tens of MB) to make a real difference to show.
+  static Future<({int statusCode, Uint8List bytes})> _downloadWithProgress(
+    String url, {
+    required String phase,
+    ModelLoadProgress? onProgress,
+  }) async {
+    final client = http.Client();
     try {
+      final streamedResponse =
+          await client.send(http.Request('GET', Uri.parse(url)));
+      final total = streamedResponse.contentLength;
+      final chunks = <int>[];
+      var received = 0;
+      onProgress?.call(phase, fraction: total != null ? 0.0 : null);
+      await for (final chunk in streamedResponse.stream) {
+        chunks.addAll(chunk);
+        received += chunk.length;
+        if (total != null && total > 0) {
+          onProgress?.call(phase, fraction: received / total);
+        }
+      }
+      return (
+        statusCode: streamedResponse.statusCode,
+        bytes: Uint8List.fromList(chunks),
+      );
+    } finally {
+      client.close();
+    }
+  }
+
+  /// Sniffs whether [bytes] look like an HTML page rather than the binary
+  /// (or JSON/text) file that was actually requested — the signature of a
+  /// host serving a sign-in/interstitial/error page with an HTTP 200 status
+  /// instead of the real file.
+  static bool _looksLikeHtml(Uint8List bytes) {
+    if (bytes.isEmpty) return false;
+    final headLen = bytes.length < 200 ? bytes.length : 200;
+    final head = String.fromCharCodes(bytes.sublist(0, headLen)).toLowerCase();
+    return head.contains('<!doctype html') || head.contains('<html');
+  }
+
+  static Future<ModelUpdateStatus> checkAndUpdateModel({
+    ModelLoadProgress? onProgress,
+  }) async {
+    try {
+      onProgress?.call('Checking for model updates...');
       final resp = await http.get(Uri.parse(_metaUrl));
       if (resp.statusCode != 200) {
         AppLogger.w('ModelManager: meta download failed: ${resp.statusCode}');
@@ -213,58 +274,95 @@ class ModelManager {
               : null;
 
       final currentVersion = await getCurrentModelVersion();
+      final fileStillPresent = await hasLocalModel();
       AppLogger.d(
-          'ModelManager: local version=$currentVersion, remote version=$newVersion');
+          'ModelManager: local version=$currentVersion, remote version=$newVersion, '
+          'local file present=$fileStillPresent');
 
-      if (newVersion <= currentVersion) {
+      // The version number alone isn't proof the cached model is actually
+      // usable — it's a separate SharedPreferences value that survives even
+      // if the cached .tflite file itself gets deleted (manually, storage
+      // cleared, etc). Trusting the version alone here silently fell back
+      // to the bundled asset with no warning logged, since nothing "failed"
+      // from this function's point of view. Re-download whenever the file
+      // is missing, regardless of what the version marker claims.
+      if (newVersion <= currentVersion && fileStillPresent) {
         AppLogger.i(
             'ModelManager: local model is up to date (v$currentVersion).');
         return ModelUpdateStatus.upToDate;
+      }
+      if (newVersion <= currentVersion && !fileStillPresent) {
+        AppLogger.w(
+            'ModelManager: version record (v$currentVersion) says up to '
+            'date, but the cached model file is missing on disk — '
+            're-downloading.');
       }
 
       AppLogger.i(
           'ModelManager: downloading new model version $newVersion ...');
 
-      final List<Future<http.Response>> futures = [
-        http.get(Uri.parse(modelUrl)),
-        http.get(Uri.parse(labelsUrl)),
-      ];
+      // All three requests are kicked off together (same as before); only
+      // the model download is streamed for progress, since it's the only
+      // one large enough for that to matter.
+      final modelDownload = _downloadWithProgress(
+        modelUrl,
+        phase: 'Downloading new model...',
+        onProgress: onProgress,
+      );
+      final labelsFuture = http.get(Uri.parse(labelsUrl));
+      final rejectionFuture = (rejectionUrl != null && rejectionUrl.isNotEmpty)
+          ? http.get(Uri.parse(rejectionUrl))
+          : null;
 
-      if (rejectionUrl != null && rejectionUrl.isNotEmpty) {
-        futures.add(http.get(Uri.parse(rejectionUrl)));
-      }
+      final modelResult = await modelDownload;
+      final labelsResp = await labelsFuture;
+      final rejectionResp =
+          rejectionFuture != null ? await rejectionFuture : null;
 
-      final responses = await Future.wait(futures);
-
-      final modelResp = responses[0];
-      final labelsResp = responses[1];
-      http.Response? rejectionResp;
-      if (rejectionUrl != null && rejectionUrl.isNotEmpty) {
-        rejectionResp = responses[2];
-      }
-
-      if (modelResp.statusCode != 200 || labelsResp.statusCode != 200) {
+      if (modelResult.statusCode != 200 || labelsResp.statusCode != 200) {
         AppLogger.w(
-          'ModelManager: download failed: model=${modelResp.statusCode}, '
+          'ModelManager: download failed: model=${modelResult.statusCode}, '
           'labels=${labelsResp.statusCode}',
         );
         return ModelUpdateStatus.failed;
       }
 
-      if (rejectionResp != null && rejectionResp.statusCode != 200) {
+      // A 200 status doesn't guarantee real content: some hosts (Google
+      // Drive being the classic example) can serve an HTML sign-in or
+      // interstitial page with a 200 status instead of the actual file,
+      // e.g. if a "public" link's access is ever revoked or restricted.
+      // Without this check that HTML would get treated as model bytes and
+      // fail deep inside the TFLite interpreter with an opaque "not a
+      // valid Flatbuffer buffer" error instead of a clear message here.
+      if (_looksLikeHtml(modelResult.bytes) ||
+          _looksLikeHtml(labelsResp.bodyBytes)) {
         AppLogger.w(
-          'ModelManager: rejection_config download failed: '
-          '${rejectionResp.statusCode} (continuing without it)',
+          'ModelManager: download returned HTML instead of the expected '
+          'file (model_url/labels_url may no longer be publicly '
+          'accessible - check the hosting repo/release visibility).',
+        );
+        return ModelUpdateStatus.failed;
+      }
+
+      final rejectionUsable = rejectionResp != null &&
+          rejectionResp.statusCode == 200 &&
+          !_looksLikeHtml(rejectionResp.bodyBytes);
+      if (rejectionResp != null && !rejectionUsable) {
+        AppLogger.w(
+          'ModelManager: rejection_config download failed or returned HTML '
+          '(status=${rejectionResp.statusCode}) - continuing without it.',
         );
       }
 
+      onProgress?.call('Saving model locally...');
+
       final modelFile = await _localModelFile();
-      await modelFile.writeAsBytes(modelResp.bodyBytes, flush: true);
+      await modelFile.writeAsBytes(modelResult.bytes, flush: true);
 
       final labelsFile = await _localLabelsFile();
       await labelsFile.writeAsString(labelsResp.body, flush: true);
 
-      if (rejectionResp != null && rejectionResp.statusCode == 200) {
+      if (rejectionUsable) {
         final rejectionFile = await _localRejectionCfgFile();
         await rejectionFile.writeAsString(rejectionResp.body, flush: true);
         AppLogger.i('ModelManager: wrote local rejection_config.json.');

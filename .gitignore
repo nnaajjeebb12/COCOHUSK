@@ -85,3 +85,6 @@ __pycache__/
 /coconut_husk_quality_working.tflite
 /coconut_husk_quality_model_v1_4class_backup.tflite
 /demo_v2.tflite
+/class_names.txt
+/class_names_working.txt
+/rejection_config.json

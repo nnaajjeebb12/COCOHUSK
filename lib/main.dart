@@ -183,6 +183,11 @@ class _HomePageState extends State<HomePage> {
   String? _errorMessage;
   PredictionResult? _prediction;
 
+  // Phase/progress shown while the model is (re)loading, so "Loading
+  // model..." isn't a dead end during a multi-minute cloud download.
+  String _loadPhase = 'Loading model...';
+  double? _loadFraction;
+
   final List<HistoryItem> _history = [];
   final List<BatchItem> _batchResults = [];
 
@@ -194,8 +199,20 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _loadEngine() async {
     AppLogger.i('Engine load: start');
+    setState(() {
+      _loadPhase = 'Loading model...';
+      _loadFraction = null;
+    });
     try {
-      await _engine.loadDefaultModel();
+      await _engine.loadDefaultModel(
+        onProgress: (phase, {fraction}) {
+          if (!mounted) return;
+          setState(() {
+            _loadPhase = phase;
+            _loadFraction = fraction;
+          });
+        },
+      );
       if (!mounted) return;
       setState(() {
         _isModelLoaded = true;
@@ -304,12 +321,64 @@ class _HomePageState extends State<HomePage> {
     return s.length <= 140 ? s : '${s.substring(0, 140)}...';
   }
 
+  /// Clears any custom override and re-runs the normal cloud-preferred
+  /// chain: check the cloud meta URL, use the cached copy if already up to
+  /// date, or fall back to the bundled asset only if neither is available.
+  /// This does NOT force the bundled asset specifically — see
+  /// [_useBundledModel] for that.
   Future<void> _resetToDefaultModel() async {
-    AppLogger.i('Custom model: reverting to default.');
+    AppLogger.i('Custom model: reverting to default (cloud-preferred).');
     await ModelManager.clearCustomModelPath();
     await _loadEngine();
     if (!mounted) return;
-    _showSnack('Reverted to default model.');
+    _showSnack('Using cloud-preferred default (${_engine.source.name}).');
+  }
+
+  /// Forces the bundled asset (the model shipped inside the app package) to
+  /// become active right now, skipping the cloud check and any locally
+  /// cached model entirely. Complements [_resetToDefaultModel], which
+  /// prefers cloud/cached-cloud over bundled when available.
+  Future<void> _useBundledModel() async {
+    if (_isLoading) return;
+    AppLogger.i('Model: user requested bundled model.');
+    setState(() {
+      _isLoading = true;
+      _isModelLoaded = false;
+      _loadPhase = 'Loading bundled model...';
+      _loadFraction = null;
+    });
+    try {
+      await _engine.loadBundledModel(
+        onProgress: (phase, {fraction}) {
+          if (!mounted) return;
+          setState(() {
+            _loadPhase = phase;
+            _loadFraction = fraction;
+          });
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _isModelLoaded = true;
+        _errorMessage = null;
+      });
+      final warning = _engine.verificationWarning;
+      _showSnack(
+        warning == null
+            ? 'Using bundled model.'
+            : 'Using bundled model, but: $warning',
+        isError: warning != null,
+      );
+    } catch (e, st) {
+      AppLogger.e('Bundled model load: failure', e, st);
+      if (!mounted) return;
+      setState(() {
+        _isModelLoaded = false;
+        _errorMessage = 'Failed to load the bundled model.';
+      });
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
   }
 
   /// Re-runs the same load path as app startup: re-checks for a cloud
@@ -321,7 +390,13 @@ class _HomePageState extends State<HomePage> {
   Future<void> _reloadModel() async {
     if (_isLoading) return;
     AppLogger.i('Model reload: user requested.');
-    setState(() => _isLoading = true);
+    // Also drop _isModelLoaded so the result card falls through to the
+    // phase/progress display (see _buildResultSection) instead of the
+    // generic "Analyzing image..." text _isLoading alone would trigger.
+    setState(() {
+      _isLoading = true;
+      _isModelLoaded = false;
+    });
     try {
       await _loadEngine();
       if (!mounted) return;
@@ -589,6 +664,7 @@ class _HomePageState extends State<HomePage> {
                         engine: _engine,
                         onPickCustom: _loadCustomModel,
                         onResetDefault: _resetToDefaultModel,
+                        onUseBundled: _useBundledModel,
                         onReload: _reloadModel,
                       ),
                     ),
@@ -623,10 +699,15 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                     children: const [
-                      Text(
-                        'HuskTech is an offline coconut husk maturity classification app.\n\n'
-                        'It runs entirely on-device using a TensorFlow Lite model '
-                        'with dynamic model updates from the cloud or a user-supplied file.',
+                      Card(
+                        child: Padding(
+                          padding: EdgeInsets.all(12),
+                          child: Text(
+                            'HuskTech is an offline coconut husk maturity classification app.\n\n'
+                            'It runs entirely on-device using a TensorFlow Lite model '
+                            'with dynamic model updates from the cloud or a user-supplied file.',
+                          ),
+                        ),
                       ),
                     ],
                   );
@@ -672,6 +753,8 @@ class _HomePageState extends State<HomePage> {
                 padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
                 child: Column(
                   children: [
+                    _buildStrictnessSlider(context),
+                    const SizedBox(height: 16),
                     _buildImageSection(context, ready),
                     const SizedBox(height: 16),
                     _buildResultCard(context),
@@ -765,14 +848,16 @@ class _HomePageState extends State<HomePage> {
         break;
     }
 
-    String versionText;
-    if (_engine.source == ModelSource.custom) {
-      versionText = 'Model: ${_engine.activeName ?? "custom"} • $sourceLabel';
-    } else if (_engine.modelVersion > 0) {
-      versionText = 'Model version: ${_engine.modelVersion} • $sourceLabel';
-    } else {
-      versionText = 'Model version: not recorded • $sourceLabel';
-    }
+    // Always name the actual loaded model, not just its version/source —
+    // "Model version: 1 • Local" on its own says nothing about *what* is
+    // running. Version is only meaningful for cloud/local/bundled models;
+    // custom models don't carry one (loadCustomFromBytes never sets it),
+    // so it's omitted there rather than showing a stale, unrelated number.
+    final modelName = _engine.activeName ?? 'unknown model';
+    final versionText =
+        _engine.source != ModelSource.custom && _engine.modelVersion > 0
+            ? '$modelName • v${_engine.modelVersion} • $sourceLabel'
+            : '$modelName • $sourceLabel';
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -796,11 +881,107 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 4),
         Text(
           versionText,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
           style: textTheme.bodySmall?.copyWith(
             color: colorScheme.onSurface.withValues(alpha: 0.6),
           ),
         ),
       ],
+    );
+  }
+
+  String _strictnessLabel(double s) {
+    if (s < 0.2) return 'Very Lenient';
+    if (s < 0.4) return 'Lenient';
+    if (s < 0.6) return 'Balanced';
+    if (s < 0.8) return 'Strict';
+    return 'Very Strict';
+  }
+
+  /// Applies a new strictness value and, if a prediction is currently on
+  /// screen, live re-evaluates it against the new thresholds — no
+  /// re-inference needed, since PredictionResult already carries the full
+  /// probability vector (see InferenceEngine.reevaluate). Without this, the
+  /// slider would only affect the *next* photo, which reads as "the slider
+  /// doesn't do anything" when you're looking at a result already on screen.
+  void _applyStrictness(double value) {
+    setState(() {
+      _engine.setStrictness(value);
+      if (_prediction != null) {
+        _prediction = _engine.reevaluate(_prediction!);
+      }
+    });
+  }
+
+  /// Lets the user tune how easily a prediction gets accepted vs rejected,
+  /// without retraining anything. Mirrors the conf_threshold/margin_threshold
+  /// knobs already exposed in the desktop client tool. In-memory only (see
+  /// InferenceEngine.setStrictness): resets to Balanced on every app launch.
+  Widget _buildStrictnessSlider(BuildContext context) {
+    final theme = Theme.of(context);
+    final strictness = _engine.strictness;
+    final mutedColor = theme.colorScheme.onSurface.withValues(alpha: 0.6);
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.tune, size: 18, color: theme.colorScheme.primary),
+                const SizedBox(width: 8),
+                Text('Strictness',
+                    style: theme.textTheme.titleSmall
+                        ?.copyWith(fontWeight: FontWeight.w700)),
+                const Spacer(),
+                Flexible(
+                  child: Text(
+                    _strictnessLabel(strictness),
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.right,
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.restart_alt, size: 20),
+                  tooltip: 'Reset to default',
+                  visualDensity: VisualDensity.compact,
+                  onPressed:
+                      strictness == 0.5 ? null : () => _applyStrictness(0.5),
+                ),
+              ],
+            ),
+            Slider(
+              value: strictness,
+              divisions: 20,
+              label: '${(strictness * 100).round()}%',
+              onChanged: _applyStrictness,
+            ),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('Lenient',
+                    style:
+                        theme.textTheme.bodySmall?.copyWith(color: mutedColor)),
+                Text('Strict',
+                    style:
+                        theme.textTheme.bodySmall?.copyWith(color: mutedColor)),
+              ],
+            ),
+            Text(
+              'Min confidence: ${(_engine.confThreshold * 100).round()}%'
+              ' • Min margin: ${(_engine.marginThreshold * 100).round()}%',
+              style: theme.textTheme.bodySmall?.copyWith(color: mutedColor),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -878,8 +1059,27 @@ class _HomePageState extends State<HomePage> {
       );
     }
     if (!_isModelLoaded) {
-      return const Text('Loading model...',
-          style: TextStyle(fontStyle: FontStyle.italic));
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(_loadPhase, style: const TextStyle(fontStyle: FontStyle.italic)),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(value: _loadFraction, minHeight: 6),
+          ),
+          if (_loadFraction != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              '${(_loadFraction! * 100).toStringAsFixed(0)}%',
+              style: TextStyle(
+                fontSize: 12,
+                color: colorScheme.onSurface.withValues(alpha: 0.6),
+              ),
+            ),
+          ],
+        ],
+      );
     }
     if (_isLoading) {
       return const Text('Analyzing image...',
@@ -903,7 +1103,10 @@ class _HomePageState extends State<HomePage> {
         const Text('Prediction',
             style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
         const SizedBox(height: 8),
-        Row(
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             Container(
               padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 10),
@@ -920,7 +1123,6 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ),
-            const SizedBox(width: 12),
             Text('Confidence: $confidencePercent%',
                 style: const TextStyle(fontSize: 14)),
           ],
@@ -973,6 +1175,7 @@ class ModelSettingsPage extends StatefulWidget {
   final InferenceEngine engine;
   final Future<void> Function() onPickCustom;
   final Future<void> Function() onResetDefault;
+  final Future<void> Function() onUseBundled;
   final Future<void> Function() onReload;
 
   const ModelSettingsPage({
@@ -980,6 +1183,7 @@ class ModelSettingsPage extends StatefulWidget {
     required this.engine,
     required this.onPickCustom,
     required this.onResetDefault,
+    required this.onUseBundled,
     required this.onReload,
   });
 
@@ -997,6 +1201,24 @@ class _ModelSettingsPageState extends State<ModelSettingsPage> {
       await action();
     } finally {
       if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// Explains what each [ModelSource] actually means, since "local" reads
+  /// as ambiguous on its own: it specifically means "a cloud-downloaded
+  /// model cached on disk from an earlier check, still up to date" — not
+  /// the bundled asset.
+  String _sourceDescription(ModelSource source) {
+    switch (source) {
+      case ModelSource.bundled:
+        return 'Bundled (shipped with the app)';
+      case ModelSource.cloud:
+        return 'Cloud (just downloaded a newer version)';
+      case ModelSource.local:
+        return 'Local cache (downloaded from cloud previously; still up '
+            'to date)';
+      case ModelSource.custom:
+        return 'Custom (a .tflite you picked)';
     }
   }
 
@@ -1032,7 +1254,7 @@ class _ModelSettingsPageState extends State<ModelSettingsPage> {
           ),
         ],
       ),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1074,7 +1296,7 @@ class _ModelSettingsPageState extends State<ModelSettingsPage> {
                     const Divider(height: 20),
                     Text('Name: ${engine.activeName ?? "(bundled default)"}'),
                     const SizedBox(height: 4),
-                    Text('Source: ${source.name}'),
+                    Text('Source: ${_sourceDescription(source)}'),
                     if (engine.modelVersion > 0) ...[
                       const SizedBox(height: 4),
                       Text('Version: ${engine.modelVersion}'),
@@ -1123,13 +1345,39 @@ class _ModelSettingsPageState extends State<ModelSettingsPage> {
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed: _busy
+              onPressed: _busy || source == ModelSource.bundled
                   ? null
-                  : (source == ModelSource.custom
-                      ? () => _run(widget.onResetDefault)
-                      : null),
+                  : () => _run(widget.onUseBundled),
+              icon: const Icon(Icons.inventory_2_outlined),
+              label: const Text('Use bundled model'),
+            ),
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.only(left: 4),
+              child: Text(
+                'Loads the model shipped in the app, skipping the cloud '
+                'check entirely.',
+                style: theme.textTheme.bodySmall,
+              ),
+            ),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _busy ||
+                      source == ModelSource.cloud ||
+                      source == ModelSource.local
+                  ? null
+                  : () => _run(widget.onResetDefault),
               icon: const Icon(Icons.restore),
-              label: const Text('Revert to default model'),
+              label: const Text('Use cloud model (default)'),
+            ),
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.only(left: 4),
+              child: Text(
+                'Checks for a cloud update; uses the cached copy if already '
+                'up to date, or the bundled model if the check fails.',
+                style: theme.textTheme.bodySmall,
+              ),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
@@ -1151,7 +1399,7 @@ class _ModelSettingsPageState extends State<ModelSettingsPage> {
               icon: const Icon(Icons.menu_book),
               label: const Text('What model can I upload?'),
             ),
-            const Spacer(),
+            const SizedBox(height: 24),
             Text(
               'The selected custom model is copied into app storage and reloaded '
               'automatically on next launch. If a custom model fails to load, '
@@ -1472,14 +1720,17 @@ class HistoryDetailPage extends StatelessWidget {
                     children: [
                       Icon(classIcon(p.predictedClass), color: badgeColor),
                       const SizedBox(width: 8),
-                      Text(
-                        readableClass,
-                        style: theme.textTheme.titleLarge?.copyWith(
-                          color: badgeColor,
-                          fontWeight: FontWeight.bold,
+                      Expanded(
+                        child: Text(
+                          readableClass,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.titleLarge?.copyWith(
+                            color: badgeColor,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ),
-                      const Spacer(),
+                      const SizedBox(width: 8),
                       Text(
                         '${(p.confidence * 100).toStringAsFixed(1)}%',
                         style: theme.textTheme.titleMedium?.copyWith(
@@ -1511,11 +1762,14 @@ class HistoryDetailPage extends StatelessWidget {
                         const Icon(Icons.info_outline,
                             color: Colors.red, size: 18),
                         const SizedBox(width: 6),
-                        Text(
-                          'Why was this rejected?',
-                          style: theme.textTheme.titleSmall?.copyWith(
-                            color: Colors.red.shade700,
-                            fontWeight: FontWeight.w700,
+                        Expanded(
+                          child: Text(
+                            'Why was this rejected?',
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleSmall?.copyWith(
+                              color: Colors.red.shade700,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
                         ),
                       ],
@@ -1564,15 +1818,19 @@ class HistoryDetailPage extends StatelessWidget {
                           children: [
                             Row(
                               children: [
-                                Text(
-                                  formatClassName(entry.key),
-                                  style: theme.textTheme.bodyMedium?.copyWith(
-                                    fontWeight: entry.key == p.rawPredictedClass
-                                        ? FontWeight.bold
-                                        : FontWeight.normal,
+                                Expanded(
+                                  child: Text(
+                                    formatClassName(entry.key),
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      fontWeight:
+                                          entry.key == p.rawPredictedClass
+                                              ? FontWeight.bold
+                                              : FontWeight.normal,
+                                    ),
                                   ),
                                 ),
-                                const Spacer(),
+                                const SizedBox(width: 8),
                                 Text(
                                   '${(entry.value * 100).toStringAsFixed(1)}%',
                                   style: theme.textTheme.bodySmall,

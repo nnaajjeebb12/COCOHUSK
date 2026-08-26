@@ -59,11 +59,54 @@ class InferenceEngine {
   List<int>? _outputShape;
   String? _verificationWarning;
 
-  static const double _confThreshold = 0.70;
-  static const double _marginThreshold = 0.20;
+  // The confidence/margin thresholds below are user-tunable via a single
+  // 0.0 (lenient) - 1.0 (strict) "strictness" slider (see setStrictness).
+  // Strictness is in-memory only, not persisted; it resets to 0.5 (Balanced)
+  // on every app launch, same idea as the desktop client tool's
+  // conf_threshold/margin_threshold it mirrors.
+  //
+  // These bounds were originally 0.50-0.90 confidence / 0.10-0.30 margin
+  // (chosen to reproduce the app's old fixed 0.70/0.20 defaults at the
+  // midpoint) but that range turned out to be the wrong shape for this
+  // model: measured across all 180 real training photos, confidence was
+  // 96-100% (median 100%) and margin was 92.1-100% (median 100%) - meaning
+  // the old range sat entirely below where the model actually operates, so
+  // the slider had no visible effect on any real photo at any position.
+  // Recalibrated so the Strict end actually rejects the model's real
+  // low-confidence tail instead of never triggering.
+  static const double _lenientConfThreshold = 0.85;
+  static const double _strictConfThreshold = 0.999;
+  static const double _lenientMarginThreshold = 0.80;
+  static const double _strictMarginThreshold = 0.99;
+  static const double _defaultStrictness = 0.5;
+
+  double _strictness = _defaultStrictness;
+  double _confThreshold =
+      _lerp(_lenientConfThreshold, _strictConfThreshold, _defaultStrictness);
+  double _marginThreshold = _lerp(
+      _lenientMarginThreshold, _strictMarginThreshold, _defaultStrictness);
+
   static const double _distanceK = 2.0;
   static const int _inputSize = 224;
   static const int _numChannels = 3;
+
+  static double _lerp(double a, double b, double t) => a + (b - a) * t;
+
+  /// Current strictness, 0.0 (lenient) - 1.0 (strict).
+  double get strictness => _strictness;
+  double get confThreshold => _confThreshold;
+  double get marginThreshold => _marginThreshold;
+
+  /// Adjusts how strict the rejection layer is for future predictions.
+  /// Does not affect predictions already made (e.g. history entries keep
+  /// whatever verdict they were given at the time).
+  void setStrictness(double value) {
+    _strictness = value.clamp(0.0, 1.0);
+    _confThreshold =
+        _lerp(_lenientConfThreshold, _strictConfThreshold, _strictness);
+    _marginThreshold =
+        _lerp(_lenientMarginThreshold, _strictMarginThreshold, _strictness);
+  }
 
   bool get isReady => _interpreter != null && _labels.isNotEmpty;
 
@@ -84,8 +127,15 @@ class InferenceEngine {
   int get modelVersion => _modelVersion;
   List<String> get labels => List.unmodifiable(_labels);
 
-  Future<void> loadDefaultModel() async {
-    final updateStatus = await ModelManager.checkAndUpdateModel();
+  /// [onProgress], when given, is called with a human-readable phase (and a
+  /// 0.0-1.0 fraction during the one step that can actually report real
+  /// progress: downloading a new cloud model) so the UI can show something
+  /// better than a static "Loading model..." message during what can be a
+  /// multi-minute cloud download.
+  Future<void> loadDefaultModel({ModelLoadProgress? onProgress}) async {
+    final updateStatus =
+        await ModelManager.checkAndUpdateModel(onProgress: onProgress);
+    onProgress?.call('Reading model...');
     final active = await ModelManager.readActiveModelBytes(
       updateStatus: updateStatus,
       readBundledAsset: () async {
@@ -98,30 +148,99 @@ class InferenceEngine {
       },
     );
 
-    final labelsStr = (active.source == ModelSource.local ||
-            active.source == ModelSource.cloud)
-        ? await ModelManager.readLocalLabels()
-        : await rootBundle.loadString('assets/model/class_names.txt');
+    // Whatever readActiveModelBytes resolved (custom/local/cloud/bundled)
+    // can still turn out to be unusable — a corrupted cache file, or a
+    // "download" that actually returned an HTML error page (see
+    // ModelManager's HTML-sniff check, which catches most of that case
+    // before it even gets here, but not everything: a truncated download,
+    // disk corruption, etc). Rather than leave the engine with no working
+    // model at all in that case, fall back to the bundled asset, which is
+    // the one source guaranteed to actually be there.
+    try {
+      final labelsStr = (active.source == ModelSource.local ||
+              active.source == ModelSource.cloud)
+          ? await ModelManager.readLocalLabels()
+          : await rootBundle.loadString('assets/model/class_names.txt');
 
-    _swapInterpreter(Interpreter.fromBuffer(active.bytes));
+      onProgress?.call('Loading model into memory...');
+      final interpreter = Interpreter.fromBuffer(active.bytes);
+
+      _swapInterpreter(interpreter);
+      _labels = labelsStr
+          .split('\n')
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toList(growable: false);
+      _source = active.source;
+      _activePath = active.path;
+      _activeName = active.path == null
+          ? 'coconut_husk_quality_model.tflite (bundled)'
+          : active.path!.split(Platform.pathSeparator).last;
+      _modelVersion = await ModelManager.getCurrentModelVersion();
+
+      onProgress?.call('Verifying model...');
+      await _loadRejectionConfig();
+      _verifyTensors();
+
+      AppLogger.i('Inference engine: ready, model=$_activeName '
+          'source=${_source.name} labels=${_labels.length} '
+          'version=$_modelVersion');
+    } catch (e, st) {
+      if (active.source == ModelSource.bundled) {
+        // Already the bundled asset and it still failed — nothing left to
+        // fall back to; let the caller's own error handling take over.
+        rethrow;
+      }
+      AppLogger.e(
+        'Inference engine: failed to load ${active.source.name} model '
+        '(${active.path ?? "?"}); falling back to the bundled asset.',
+        e,
+        st,
+      );
+      await loadBundledModel(onProgress: onProgress);
+    }
+  }
+
+  /// Forces the bundled asset (model + labels + rejection config, all three
+  /// from the app package, none from cache) to become active right now,
+  /// bypassing the cloud check and any locally cached model entirely -
+  /// distinct from [loadDefaultModel], which prefers cloud/cached-cloud and
+  /// only falls back to bundled when nothing else is available. Also clears
+  /// any custom override, so it doesn't immediately reassert itself.
+  ///
+  /// Does not delete the locally cached cloud files, so a later
+  /// [loadDefaultModel] call (e.g. the ordinary reload/relaunch path) can
+  /// still find and use them again - this is a one-time "use bundled right
+  /// now" action, not a permanent opt-out of cloud updates.
+  Future<void> loadBundledModel({ModelLoadProgress? onProgress}) async {
+    onProgress?.call('Loading bundled model...');
+    await ModelManager.clearCustomModelPath();
+
+    final data =
+        await rootBundle.load('assets/model/coconut_husk_quality_model.tflite');
+    final bytes =
+        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+    final labelsStr =
+        await rootBundle.loadString('assets/model/class_names.txt');
+
+    onProgress?.call('Loading model into memory...');
+    _swapInterpreter(Interpreter.fromBuffer(bytes));
     _labels = labelsStr
         .split('\n')
         .map((e) => e.trim())
         .where((e) => e.isNotEmpty)
         .toList(growable: false);
-    _source = active.source;
-    _activePath = active.path;
-    _activeName = active.path == null
-        ? 'coconut_husk_quality_model.tflite (bundled)'
-        : active.path!.split(Platform.pathSeparator).last;
-    _modelVersion = await ModelManager.getCurrentModelVersion();
+    _source = ModelSource.bundled;
+    _activePath = null;
+    _activeName = 'coconut_husk_quality_model.tflite (bundled)';
+    _modelVersion = 0;
 
-    await _loadRejectionConfig();
+    onProgress?.call('Verifying model...');
+    await _loadBundledRejectionConfig();
     _verifyTensors();
 
-    AppLogger.i('Inference engine: ready, model=$_activeName '
-        'source=${_source.name} labels=${_labels.length} '
-        'version=$_modelVersion');
+    AppLogger.i('Inference engine: forced to bundled asset - '
+        'labels=${_labels.length}');
   }
 
   /// Confirms the loaded interpreter's tensors actually match the contract
@@ -215,12 +334,27 @@ class InferenceEngine {
     _interpreter = next;
   }
 
+  /// Local cache preferred, falling back to the bundled asset. Used by the
+  /// normal (cloud-preferred) load path.
   Future<void> _loadRejectionConfig() async {
-    try {
-      String? jsonStr = await ModelManager.readLocalRejectionConfig();
-      jsonStr ??=
-          await rootBundle.loadString('assets/model/rejection_config.json');
+    String? jsonStr = await ModelManager.readLocalRejectionConfig();
+    jsonStr ??=
+        await rootBundle.loadString('assets/model/rejection_config.json');
+    await _applyRejectionConfigJson(jsonStr);
+  }
 
+  /// Always the bundled asset, ignoring any locally cached rejection config
+  /// even if one exists. Used by [loadBundledModel], so "use the bundled
+  /// model" means the whole bundled trio (model + labels + rejection
+  /// config), not a mix of bundled model with a stale cached config.
+  Future<void> _loadBundledRejectionConfig() async {
+    final jsonStr =
+        await rootBundle.loadString('assets/model/rejection_config.json');
+    await _applyRejectionConfigJson(jsonStr);
+  }
+
+  Future<void> _applyRejectionConfigJson(String jsonStr) async {
+    try {
       final data = jsonDecode(jsonStr) as Map<String, dynamic>;
       final centroidsRaw =
           (data['centroids'] as Map<String, dynamic>? ?? const {});
@@ -300,83 +434,109 @@ class InferenceEngine {
         }
       }
 
-      int maxIndex = 0;
-      double maxScore = probs[0];
-      for (int i = 1; i < probs.length; i++) {
-        if (probs[i] > maxScore) {
-          maxScore = probs[i];
-          maxIndex = i;
-        }
-      }
-
-      double top2 = 0.0;
-      for (int i = 0; i < probs.length; i++) {
-        if (i == maxIndex) continue;
-        if (probs[i] > top2) top2 = probs[i];
-      }
-      final margin = maxScore - top2;
-
-      String predictedClass =
-          (maxIndex < _labels.length) ? _labels[maxIndex] : 'unknown';
-      final confidence = maxScore;
-
-      final classProbabilities = <String, double>{
-        for (int i = 0; i < _labels.length && i < probs.length; i++)
-          _labels[i]: probs[i],
-      };
-
-      bool rejected = false;
-      String? rejectionReason;
-      if (confidence < _confThreshold) {
-        rejected = true;
-        rejectionReason = 'Confidence '
-            '(${(confidence * 100).toStringAsFixed(1)}%) is below the '
-            '${(_confThreshold * 100).toStringAsFixed(0)}% minimum needed '
-            'to accept a prediction.';
-      } else if (probs.length >= 2 && margin < _marginThreshold) {
-        rejected = true;
-        rejectionReason = 'The top two classes were too close '
-            '(${(margin * 100).toStringAsFixed(1)}% apart, '
-            '${(_marginThreshold * 100).toStringAsFixed(0)}% minimum needed) '
-            'for the model to confidently tell them apart.';
-      } else if (_centroids.isNotEmpty &&
-          _distStats.isNotEmpty &&
-          _labels.length == probs.length) {
-        bool allFar = true;
-        for (int i = 0; i < _labels.length; i++) {
-          final centroid = _centroids[_labels[i]];
-          final stats = _distStats[_labels[i]];
-          if (centroid == null || stats == null) continue;
-          final dist = _euclidean(probs, centroid);
-          final mean = stats['mean_dist'] ?? 0.0;
-          final std = stats['std_dist'] ?? 0.0;
-          if (dist <= mean + _distanceK * std) {
-            allFar = false;
-            break;
-          }
-        }
-        if (allFar) {
-          rejected = true;
-          rejectionReason = 'The prediction pattern for this image does '
-              'not closely resemble any known class from prior examples, '
-              'it likely is not a coconut husk, or the photo is unclear.';
-        }
-      }
-
-      final finalClass = rejected ? 'rejected' : predictedClass;
-      return PredictionResult(
-        predictedClass: finalClass,
-        confidence: confidence,
-        explanation: _explanationForClass(finalClass),
-        classProbabilities: classProbabilities,
-        rawPredictedClass: predictedClass,
-        margin: margin,
-        rejectionReason: rejectionReason,
-      );
+      return _buildResult(probs);
     } catch (e, st) {
       AppLogger.e('Inference error', e, st);
       return null;
     }
+  }
+
+  /// Re-applies the rejection layer to an already-computed prediction using
+  /// the CURRENT thresholds, without re-running the model. This is what
+  /// lets the strictness slider live-update an on-screen result: [previous]
+  /// already carries the full probability vector, so there's nothing to
+  /// recompute except the accept/reject decision itself.
+  PredictionResult reevaluate(PredictionResult previous) {
+    final probs = [
+      for (final label in _labels) previous.classProbabilities[label] ?? 0.0,
+    ];
+    if (probs.isEmpty || probs.every((p) => p == 0.0)) {
+      // Labels changed (e.g. a different model loaded) since previous was
+      // computed; nothing sane to re-derive from, leave it as-is.
+      return previous;
+    }
+    return _buildResult(probs);
+  }
+
+  /// Applies the confidence/margin/centroid-distance rejection layer to a
+  /// (normalized) probability vector and builds the resulting
+  /// [PredictionResult]. Shared by [predictFromBytes] (fresh inference) and
+  /// [reevaluate] (re-deriving a verdict from an already-computed vector at
+  /// new thresholds), so the two can never drift out of sync.
+  PredictionResult _buildResult(List<double> probs) {
+    int maxIndex = 0;
+    double maxScore = probs[0];
+    for (int i = 1; i < probs.length; i++) {
+      if (probs[i] > maxScore) {
+        maxScore = probs[i];
+        maxIndex = i;
+      }
+    }
+
+    double top2 = 0.0;
+    for (int i = 0; i < probs.length; i++) {
+      if (i == maxIndex) continue;
+      if (probs[i] > top2) top2 = probs[i];
+    }
+    final margin = maxScore - top2;
+
+    String predictedClass =
+        (maxIndex < _labels.length) ? _labels[maxIndex] : 'unknown';
+    final confidence = maxScore;
+
+    final classProbabilities = <String, double>{
+      for (int i = 0; i < _labels.length && i < probs.length; i++)
+        _labels[i]: probs[i],
+    };
+
+    bool rejected = false;
+    String? rejectionReason;
+    if (confidence < _confThreshold) {
+      rejected = true;
+      rejectionReason = 'Confidence '
+          '(${(confidence * 100).toStringAsFixed(1)}%) is below the '
+          '${(_confThreshold * 100).toStringAsFixed(0)}% minimum needed '
+          'to accept a prediction.';
+    } else if (probs.length >= 2 && margin < _marginThreshold) {
+      rejected = true;
+      rejectionReason = 'The top two classes were too close '
+          '(${(margin * 100).toStringAsFixed(1)}% apart, '
+          '${(_marginThreshold * 100).toStringAsFixed(0)}% minimum needed) '
+          'for the model to confidently tell them apart.';
+    } else if (_centroids.isNotEmpty &&
+        _distStats.isNotEmpty &&
+        _labels.length == probs.length) {
+      bool allFar = true;
+      for (int i = 0; i < _labels.length; i++) {
+        final centroid = _centroids[_labels[i]];
+        final stats = _distStats[_labels[i]];
+        if (centroid == null || stats == null) continue;
+        final dist = _euclidean(probs, centroid);
+        final mean = stats['mean_dist'] ?? 0.0;
+        final std = stats['std_dist'] ?? 0.0;
+        if (dist <= mean + _distanceK * std) {
+          allFar = false;
+          break;
+        }
+      }
+      if (allFar) {
+        rejected = true;
+        rejectionReason = 'The prediction pattern for this image does '
+            'not closely resemble any known class from prior examples, '
+            'it likely is not a coconut husk, or the photo is unclear.';
+      }
+    }
+
+    final finalClass = rejected ? 'rejected' : predictedClass;
+    return PredictionResult(
+      predictedClass: finalClass,
+      confidence: confidence,
+      explanation: _explanationForClass(finalClass),
+      classProbabilities: classProbabilities,
+      rawPredictedClass: predictedClass,
+      margin: margin,
+      rejectionReason: rejectionReason,
+    );
   }
 
   double _euclidean(List<double> a, List<double> b) {
