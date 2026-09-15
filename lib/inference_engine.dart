@@ -15,6 +15,11 @@ class PredictionResult {
   final double confidence;
   final String explanation;
 
+  /// Short "typically used for" note for the predicted class, shown as a
+  /// discreet secondary line alongside [explanation]. Null for classes with
+  /// no meaningful use-case list (e.g. "rejected").
+  final String? useCases;
+
   /// Every class's probability, in the model's output order, the full
   /// breakdown behind [predictedClass], for UI that wants to show "how"
   /// an image was classified rather than just the final answer.
@@ -36,6 +41,7 @@ class PredictionResult {
     required this.predictedClass,
     required this.confidence,
     required this.explanation,
+    this.useCases,
     this.classProbabilities = const {},
     String? rawPredictedClass,
     this.margin = 0.0,
@@ -532,6 +538,7 @@ class InferenceEngine {
       predictedClass: finalClass,
       confidence: confidence,
       explanation: _explanationForClass(finalClass),
+      useCases: _useCasesForClass(finalClass),
       classProbabilities: classProbabilities,
       rawPredictedClass: predictedClass,
       margin: margin,
@@ -613,6 +620,22 @@ class InferenceEngine {
             'husk image on a plain background.';
       default:
         return 'Unknown maturity stage.';
+    }
+  }
+
+  String? _useCasesForClass(String predictedClass) {
+    switch (predictedClass) {
+      case 'immature':
+        return 'Best for: coco peat, coir fiber, mulch, compost, soil '
+            'conditioner.';
+      case 'mature':
+        return 'Best for: coir fiber, coco peat, rope/twine, doormats, '
+            'floor mats.';
+      case 'overmature':
+        return 'Best for: coir fiber, coco peat, rope/twine, doormats, '
+            'floor mats.';
+      default:
+        return null;
     }
   }
 

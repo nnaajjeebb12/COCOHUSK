@@ -8,6 +8,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app_logger.dart';
+import 'history_store.dart';
+import 'history_trends_view.dart';
 import 'inference_engine.dart';
 import 'live_camera_page.dart';
 import 'log_page.dart';
@@ -135,18 +137,6 @@ class _HuskTechAppState extends State<HuskTechApp> {
   }
 }
 
-class HistoryItem {
-  final String imagePath;
-  final PredictionResult prediction;
-  final DateTime timestamp;
-
-  HistoryItem({
-    required this.imagePath,
-    required this.prediction,
-    required this.timestamp,
-  });
-}
-
 class BatchItem {
   final String imagePath;
   final String predictedClass;
@@ -188,13 +178,19 @@ class _HomePageState extends State<HomePage> {
   String _loadPhase = 'Loading model...';
   double? _loadFraction;
 
-  final List<HistoryItem> _history = [];
   final List<BatchItem> _batchResults = [];
+
+  // Shown low-key in the About dialog, see DeviceId's doc comment for why
+  // this exists at all given the app has no server or sync.
+  String? _deviceId;
 
   @override
   void initState() {
     super.initState();
     _loadEngine();
+    DeviceId.get().then((id) {
+      if (mounted) setState(() => _deviceId = id);
+    });
   }
 
   Future<void> _loadEngine() async {
@@ -446,12 +442,9 @@ class _HomePageState extends State<HomePage> {
       final path =
           '${dir.path}/capture_${DateTime.now().millisecondsSinceEpoch}.jpg';
       final f = await File(path).writeAsBytes(captured.bytes, flush: true);
-      _history.add(
-        HistoryItem(
-          imagePath: f.path,
-          prediction: captured.prediction,
-          timestamp: DateTime.now(),
-        ),
+      await HistoryStore.instance.insert(
+        imagePath: f.path,
+        prediction: captured.prediction,
       );
       if (!mounted) return;
       setState(() {
@@ -521,11 +514,7 @@ class _HomePageState extends State<HomePage> {
             predictedClass: p.predictedClass,
             confidence: p.confidence,
           ));
-          _history.add(HistoryItem(
-            imagePath: f.path,
-            prediction: p,
-            timestamp: DateTime.now(),
-          ));
+          await HistoryStore.instance.insert(imagePath: f.path, prediction: p);
         }
       }
 
@@ -573,11 +562,10 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
-    _history.add(HistoryItem(
+    await HistoryStore.instance.insert(
       imagePath: _selectedImage!.path,
       prediction: result,
-      timestamp: DateTime.now(),
-    ));
+    );
 
     setState(() {
       _prediction = result;
@@ -639,7 +627,7 @@ class _HomePageState extends State<HomePage> {
             onPressed: () {
               Navigator.of(context).push(
                 MaterialPageRoute(
-                  builder: (_) => HistoryPage(history: _history),
+                  builder: (_) => const HistoryPage(),
                 ),
               );
             },
@@ -698,8 +686,8 @@ class _HomePageState extends State<HomePage> {
                             const SizedBox(width: 48, height: 48),
                       ),
                     ),
-                    children: const [
-                      Card(
+                    children: [
+                      const Card(
                         child: Padding(
                           padding: EdgeInsets.all(12),
                           child: Text(
@@ -709,6 +697,20 @@ class _HomePageState extends State<HomePage> {
                           ),
                         ),
                       ),
+                      if (_deviceId != null)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            'Device ID: $_deviceId',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withValues(alpha: 0.5),
+                            ),
+                          ),
+                        ),
                     ],
                   );
                   break;
@@ -1129,6 +1131,17 @@ class _HomePageState extends State<HomePage> {
         ),
         const SizedBox(height: 8),
         Text(p.explanation, style: const TextStyle(fontSize: 13)),
+        if (p.useCases != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            p.useCases!,
+            style: TextStyle(
+              fontSize: 12,
+              fontStyle: FontStyle.italic,
+              color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.65),
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -1614,63 +1627,124 @@ class ModelUploadGuidePage extends StatelessWidget {
 }
 
 /// ===== HISTORY PAGE =====
-class HistoryPage extends StatelessWidget {
-  final List<HistoryItem> history;
-  const HistoryPage({super.key, required this.history});
+/// History is backed by [HistoryStore] (a persistent local SQLite database),
+/// not an in-memory list, so it survives app restarts. Two tabs: the
+/// per-entry log (as before), and a Day/Week/Month/Year trends chart.
+class HistoryPage extends StatefulWidget {
+  const HistoryPage({super.key});
+
+  @override
+  State<HistoryPage> createState() => _HistoryPageState();
+}
+
+class _HistoryPageState extends State<HistoryPage> {
+  late Future<List<HistoryItem>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = HistoryStore.instance.fetchAll();
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _future = HistoryStore.instance.fetchAll());
+    await _future;
+  }
 
   @override
   Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('History'),
+          bottom: const TabBar(
+            tabs: [
+              Tab(text: 'Log'),
+              Tab(icon: Icon(Icons.show_chart), text: 'Trends'),
+            ],
+          ),
+        ),
+        body: TabBarView(
+          children: [
+            _buildLog(context),
+            const HistoryTrendsView(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLog(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(title: const Text('History')),
-      body: history.isEmpty
-          ? const Center(child: Text('No history yet.'))
-          : ListView.builder(
-              padding: const EdgeInsets.all(12),
-              itemCount: history.length,
-              itemBuilder: (context, index) {
-                final item = history[index];
-                final badgeColor = classBadgeColor(
-                  item.prediction.predictedClass,
-                  colorScheme.primary,
-                );
-                return Card(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  child: ListTile(
-                    onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => HistoryDetailPage(item: item),
-                      ),
+    return RefreshIndicator(
+      onRefresh: _refresh,
+      child: FutureBuilder<List<HistoryItem>>(
+        future: _future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final history = snapshot.data ?? const [];
+          if (history.isEmpty) {
+            return LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                  child: const Center(child: Text('No history yet.')),
+                ),
+              ),
+            );
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: history.length,
+            itemBuilder: (context, index) {
+              final item = history[index];
+              final badgeColor = classBadgeColor(
+                item.prediction.predictedClass,
+                colorScheme.primary,
+              );
+              return Card(
+                margin: const EdgeInsets.only(bottom: 10),
+                child: ListTile(
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => HistoryDetailPage(item: item),
                     ),
-                    leading: ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: Image.file(
-                        File(item.imagePath),
-                        width: 48,
-                        height: 48,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) =>
-                            const Icon(Icons.broken_image, size: 32),
-                      ),
-                    ),
-                    title: Text(
-                      formatClassName(item.prediction.predictedClass),
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                        color: badgeColor,
-                      ),
-                    ),
-                    subtitle: Text(
-                      'Confidence: '
-                      '${(item.prediction.confidence * 100).toStringAsFixed(1)}%\n'
-                      '${item.timestamp}',
-                    ),
-                    isThreeLine: true,
-                    trailing: const Icon(Icons.chevron_right),
                   ),
-                );
-              },
-            ),
+                  leading: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.file(
+                      File(item.imagePath),
+                      width: 48,
+                      height: 48,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.broken_image, size: 32),
+                    ),
+                  ),
+                  title: Text(
+                    formatClassName(item.prediction.predictedClass),
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: badgeColor,
+                    ),
+                  ),
+                  subtitle: Text(
+                    'Confidence: '
+                    '${(item.prediction.confidence * 100).toStringAsFixed(1)}%\n'
+                    '${item.timestamp}',
+                  ),
+                  isThreeLine: true,
+                  trailing: const Icon(Icons.chevron_right),
+                ),
+              );
+            },
+          );
+        },
+      ),
     );
   }
 }
@@ -1744,6 +1818,15 @@ class HistoryDetailPage extends StatelessWidget {
                   Text('${item.timestamp}', style: theme.textTheme.bodySmall),
                   const SizedBox(height: 12),
                   Text(p.explanation, style: theme.textTheme.bodyMedium),
+                  if (p.useCases != null) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      p.useCases!,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1941,6 +2024,7 @@ class InfoPage extends StatelessWidget {
               'Husk has not fully developed yet',
               'Fibers are underdeveloped and moisture content is high',
               'Best left to mature further before harvesting/processing',
+              'Best for: coco peat, coir fiber, mulch, compost, soil conditioner',
             ],
           ),
           _gradeCard(
@@ -1952,6 +2036,7 @@ class InfoPage extends StatelessWidget {
               'Fully developed, high-quality fibers',
               'Ideal moisture content',
               'The ideal harvest stage for top processing quality',
+              'Best for: coir fiber, coco peat, rope/twine, doormats, floor mats',
             ],
           ),
           _gradeCard(
@@ -1963,6 +2048,7 @@ class InfoPage extends StatelessWidget {
               'Husk has aged past its ideal stage',
               'Fibers may be dry or degraded',
               'Reduced processing quality',
+              'Best for: coir fiber, coco peat, rope/twine, doormats, floor mats',
             ],
           ),
           _gradeCard(
@@ -1973,6 +2059,21 @@ class InfoPage extends StatelessWidget {
             lines: const [
               'The image does not resemble a coconut husk, or quality is too low.',
               'Please recapture on a plain background with clear visibility.',
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text('Your data', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 12),
+          _gradeCard(
+            theme,
+            color: theme.colorScheme.primary,
+            icon: Icons.phonelink_lock,
+            title: 'Stored on this device only',
+            lines: const [
+              'Scan history, photos, and trends are saved in a local database '
+                  'on this device. Nothing is uploaded or shared.',
+              'Each device keeps its own history; another device cannot see '
+                  'yours.',
             ],
           ),
         ],
@@ -2039,7 +2140,10 @@ class ManualPage extends StatelessWidget {
         '"Rejected", recapture a clearer husk image.',
     'Use the Information page to understand the meaning of each maturity '
         'level.',
-    'You can review previous scans in the History section.',
+    'Tap the History icon to review previous scans. The "Log" tab lists '
+        'every scan with its photo and result; the "Trends" tab charts how '
+        'many of each stage were scanned per Day, Week, Month, or Year, with '
+        'totals underneath. History is stored only on this device.',
     'To use a different model, open the menu and choose "Model Settings" '
         'to load a .tflite file from storage. See "Custom Model Guide" for '
         'the file format the app expects.',

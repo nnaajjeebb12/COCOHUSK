@@ -40,6 +40,20 @@ dependencies:
   # Structured logging for diagnostics across the app.
   logger: ^2.4.0
 
+  # Persistent local history: SQLite for Android (the real target), plus
+  # sqflite_common_ffi's desktop backend so the same code path also works
+  # in `flutter run -d windows` during development.
+  sqflite: ^2.3.3+1
+  sqflite_common_ffi: ^2.3.3
+  path: ^1.9.0
+
+  # Per-device random identifier, generated once and stored locally, stamped
+  # on every saved prediction. See history_store.dart for why.
+  uuid: ^4.4.2
+
+  # Charting for the history trends view (per-class line graph).
+  fl_chart: ^0.69.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
