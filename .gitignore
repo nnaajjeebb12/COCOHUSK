@@ -88,3 +88,4 @@ __pycache__/
 /class_names.txt
 /class_names_working.txt
 /rejection_config.json
+/evaluation/

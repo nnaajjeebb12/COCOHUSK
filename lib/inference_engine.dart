@@ -4,16 +4,23 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 import 'app_logger.dart';
+import 'husk_gate.dart';
 import 'model_manager.dart';
 
 class PredictionResult {
   final String predictedClass;
   final double confidence;
   final String explanation;
+
+  /// Short "typically used for" note for the predicted class, shown as a
+  /// discreet secondary line alongside [explanation]. Null for classes with
+  /// no meaningful use-case list (e.g. "rejected").
+  final String? useCases;
 
   /// Every class's probability, in the model's output order, the full
   /// breakdown behind [predictedClass], for UI that wants to show "how"
@@ -32,16 +39,49 @@ class PredictionResult {
   /// or null if this result wasn't rejected.
   final String? rejectionReason;
 
+  /// Image-level husk-likeness measurements behind the "is this even a
+  /// coconut husk?" check, or null for results produced before that check
+  /// existed (old history rows) or when the image could not be measured.
+  final HuskFeatures? huskFeatures;
+
+  /// The thresholds this particular result was judged against, captured at
+  /// prediction time. Stored per result rather than read live off the
+  /// engine so that a history entry always shows the reference values it
+  /// was actually decided by, not whatever the strictness slider happens to
+  /// be set to now.
+  final double confThresholdUsed;
+  final double marginThresholdUsed;
+  final double huskThresholdUsed;
+
+  /// Which check rejected this result, or [RejectionCheck.none] when it was
+  /// accepted. Lets the UI point at the row that failed instead of making
+  /// the user match prose against numbers.
+  final RejectionCheck rejectedBy;
+
   PredictionResult({
     required this.predictedClass,
     required this.confidence,
     required this.explanation,
+    this.useCases,
     this.classProbabilities = const {},
     String? rawPredictedClass,
     this.margin = 0.0,
     this.rejectionReason,
+    this.huskFeatures,
+    this.confThresholdUsed = 0.0,
+    this.marginThresholdUsed = 0.0,
+    this.huskThresholdUsed = 0.0,
+    this.rejectedBy = RejectionCheck.none,
   }) : rawPredictedClass = rawPredictedClass ?? predictedClass;
+
+  /// True when this result carries the threshold values it was judged
+  /// against. False for history rows written before they were recorded, so
+  /// the UI can omit the reference rather than show zeroes.
+  bool get hasThresholdReference => confThresholdUsed > 0.0;
 }
+
+/// The checks a prediction has to pass, in the order they are applied.
+enum RejectionCheck { none, notHusk, confidence, margin, pattern }
 
 /// Owns the active TFLite interpreter, labels, and rejection config.
 /// Shared by still-image and live-camera flows.
@@ -78,6 +118,17 @@ class InferenceEngine {
   static const double _strictConfThreshold = 0.999;
   static const double _lenientMarginThreshold = 0.80;
   static const double _strictMarginThreshold = 0.99;
+
+  // Minimum husk-likeness score (see HuskGate) an image has to reach before
+  // the model's answer is trusted at all. Measured over the project's 1332
+  // husk photos against 22 non-husk images: real husks scored 0.829 and up
+  // (median 1.000), every non-husk image scored 0.239 and below. Both ends
+  // of this range therefore sit in the empty gap between the two - at the
+  // strict end it rejected 0 of 1332 real husks while still catching all 22
+  // non-husk images, so moving the slider trades margin for margin rather
+  // than trading real rejections for real misses.
+  static const double _lenientHuskThreshold = 0.25;
+  static const double _strictHuskThreshold = 0.65;
   static const double _defaultStrictness = 0.5;
 
   double _strictness = _defaultStrictness;
@@ -85,6 +136,8 @@ class InferenceEngine {
       _lerp(_lenientConfThreshold, _strictConfThreshold, _defaultStrictness);
   double _marginThreshold = _lerp(
       _lenientMarginThreshold, _strictMarginThreshold, _defaultStrictness);
+  double _huskThreshold =
+      _lerp(_lenientHuskThreshold, _strictHuskThreshold, _defaultStrictness);
 
   static const double _distanceK = 2.0;
   static const int _inputSize = 224;
@@ -96,6 +149,20 @@ class InferenceEngine {
   double get strictness => _strictness;
   double get confThreshold => _confThreshold;
   double get marginThreshold => _marginThreshold;
+  double get huskThreshold => _huskThreshold;
+
+  /// The confidence/margin/husk thresholds at a given strictness, without
+  /// changing the engine's own setting. Used by the Information page to
+  /// print the full reference table of what each preset means.
+  static ({double confidence, double margin, double husk}) thresholdsAt(
+      double strictness) {
+    final t = strictness.clamp(0.0, 1.0);
+    return (
+      confidence: _lerp(_lenientConfThreshold, _strictConfThreshold, t),
+      margin: _lerp(_lenientMarginThreshold, _strictMarginThreshold, t),
+      husk: _lerp(_lenientHuskThreshold, _strictHuskThreshold, t),
+    );
+  }
 
   /// Adjusts how strict the rejection layer is for future predictions.
   /// Does not affect predictions already made (e.g. history entries keep
@@ -106,6 +173,8 @@ class InferenceEngine {
         _lerp(_lenientConfThreshold, _strictConfThreshold, _strictness);
     _marginThreshold =
         _lerp(_lenientMarginThreshold, _strictMarginThreshold, _strictness);
+    _huskThreshold =
+        _lerp(_lenientHuskThreshold, _strictHuskThreshold, _strictness);
   }
 
   bool get isReady => _interpreter != null && _labels.isNotEmpty;
@@ -404,7 +473,12 @@ class InferenceEngine {
     if (interpreter == null || _labels.isEmpty) return null;
 
     try {
-      final normalized = await _preprocessImage(bytes, _inputSize, _inputSize);
+      final normalized = await preprocessImage(bytes, _inputSize, _inputSize);
+
+      // Measured off the same buffer the model is about to be fed, so the
+      // husk check costs one extra pass over an already-decoded image and
+      // judges exactly the pixels the model saw.
+      final huskFeatures = HuskGate.analyze(normalized, _inputSize);
 
       final inputShape = interpreter.getInputTensor(0).shape;
       final expected = inputShape[1] * inputShape[2] * inputShape[3];
@@ -434,7 +508,7 @@ class InferenceEngine {
         }
       }
 
-      return _buildResult(probs);
+      return _buildResult(probs, huskFeatures);
     } catch (e, st) {
       AppLogger.e('Inference error', e, st);
       return null;
@@ -455,15 +529,24 @@ class InferenceEngine {
       // computed; nothing sane to re-derive from, leave it as-is.
       return previous;
     }
-    return _buildResult(probs);
+    // The husk measurements belong to the image, not to the thresholds, so
+    // they carry straight over - which is what lets the strictness slider
+    // re-decide a result already on screen without re-reading the photo.
+    return _buildResult(probs, previous.huskFeatures);
   }
 
-  /// Applies the confidence/margin/centroid-distance rejection layer to a
-  /// (normalized) probability vector and builds the resulting
+  /// Applies the husk/confidence/margin/centroid-distance rejection layer to
+  /// a (normalized) probability vector and builds the resulting
   /// [PredictionResult]. Shared by [predictFromBytes] (fresh inference) and
   /// [reevaluate] (re-deriving a verdict from an already-computed vector at
   /// new thresholds), so the two can never drift out of sync.
-  PredictionResult _buildResult(List<double> probs) {
+  ///
+  /// [features] is the image-level husk measurement, or null when there is
+  /// none to apply (a history result from before this check existed being
+  /// re-evaluated). A null simply skips the husk check rather than failing
+  /// it, so re-judging an old result cannot invent a rejection on evidence
+  /// that was never recorded.
+  PredictionResult _buildResult(List<double> probs, HuskFeatures? features) {
     int maxIndex = 0;
     double maxScore = probs[0];
     for (int i = 1; i < probs.length; i++) {
@@ -491,14 +574,34 @@ class InferenceEngine {
 
     bool rejected = false;
     String? rejectionReason;
-    if (confidence < _confThreshold) {
+    var rejectedBy = RejectionCheck.none;
+
+    // Checked first, and deliberately so. The three probability-based checks
+    // below can only ever say "the model was unsure"; none of them can say
+    // "that is not a coconut husk", because a non-husk photo makes this
+    // model answer with ~100% confidence for one class, which sails through
+    // all three (see HuskGate's class doc). Running the image check first
+    // also means the user gets the reason that actually applies - "this is
+    // not a husk" - instead of a confidence complaint about a photo whose
+    // real problem is that it is a picture of a wall.
+    if (features != null && features.score < _huskThreshold) {
       rejected = true;
+      rejectedBy = RejectionCheck.notHusk;
+      rejectionReason = 'Rejected: the image did not pass the husk check - '
+          '${features.weakestCue.reason} '
+          'It scored ${(features.score * 100).toStringAsFixed(0)}%, below '
+          'the ${(_huskThreshold * 100).toStringAsFixed(0)}% minimum, so no '
+          'maturity stage was reported.';
+    } else if (confidence < _confThreshold) {
+      rejected = true;
+      rejectedBy = RejectionCheck.confidence;
       rejectionReason = 'Confidence '
           '(${(confidence * 100).toStringAsFixed(1)}%) is below the '
           '${(_confThreshold * 100).toStringAsFixed(0)}% minimum needed '
           'to accept a prediction.';
     } else if (probs.length >= 2 && margin < _marginThreshold) {
       rejected = true;
+      rejectedBy = RejectionCheck.margin;
       rejectionReason = 'The top two classes were too close '
           '(${(margin * 100).toStringAsFixed(1)}% apart, '
           '${(_marginThreshold * 100).toStringAsFixed(0)}% minimum needed) '
@@ -521,9 +624,14 @@ class InferenceEngine {
       }
       if (allFar) {
         rejected = true;
-        rejectionReason = 'The prediction pattern for this image does '
-            'not closely resemble any known class from prior examples, '
-            'it likely is not a coconut husk, or the photo is unclear.';
+        rejectedBy = RejectionCheck.pattern;
+        // No longer claims "it is probably not a husk" - the husk check
+        // runs before this one and would already have said so. By the time
+        // a result reaches here it has passed that check, so what is left
+        // is a husk the model cannot place.
+        rejectionReason = 'The prediction pattern for this image does not '
+            'closely resemble any maturity stage from prior examples. The '
+            'husk may be between stages, or the photo unclear.';
       }
     }
 
@@ -532,10 +640,16 @@ class InferenceEngine {
       predictedClass: finalClass,
       confidence: confidence,
       explanation: _explanationForClass(finalClass),
+      useCases: _useCasesForClass(finalClass),
       classProbabilities: classProbabilities,
       rawPredictedClass: predictedClass,
       margin: margin,
       rejectionReason: rejectionReason,
+      huskFeatures: features,
+      confThresholdUsed: _confThreshold,
+      marginThresholdUsed: _marginThreshold,
+      huskThresholdUsed: _huskThreshold,
+      rejectedBy: rejectedBy,
     );
   }
 
@@ -549,7 +663,12 @@ class InferenceEngine {
     return sum <= 0 ? 0 : math.sqrt(sum);
   }
 
-  Future<List<double>> _preprocessImage(
+  /// Decodes and resizes to the model's input, returning raw 0-255 RGB.
+  /// Exposed so tests can feed real photos through the same decode/resize
+  /// the app uses, rather than through a reimplementation of it that could
+  /// agree with the calibration while the real path quietly disagrees.
+  @visibleForTesting
+  static Future<List<double>> preprocessImage(
       Uint8List bytes, int width, int height) async {
     final codec = await ui.instantiateImageCodec(bytes);
     final frame = await codec.getNextFrame();
@@ -613,6 +732,22 @@ class InferenceEngine {
             'husk image on a plain background.';
       default:
         return 'Unknown maturity stage.';
+    }
+  }
+
+  String? _useCasesForClass(String predictedClass) {
+    switch (predictedClass) {
+      case 'immature':
+        return 'Best for: coco peat, coir fiber, mulch, compost, soil '
+            'conditioner.';
+      case 'mature':
+        return 'Best for: coir fiber, coco peat, rope/twine, doormats, '
+            'floor mats.';
+      case 'overmature':
+        return 'Best for: coir fiber, coco peat, rope/twine, doormats, '
+            'floor mats.';
+      default:
+        return null;
     }
   }
 

@@ -37,8 +37,8 @@ contract a custom model must satisfy.
 
 ## Features
 
-- **On-device inference** with a TFLite EfficientNetB0-based classifier
-  (224x224 input, transfer-learned; see "Model training & assets" below for
+- **On-device inference** with a TFLite CNN classifier (3 convolutional
+  blocks, 224x224 input, 3 classes; see "Model training & assets" below for
   the training recipe).
 - **Live camera preview with continuous prediction** on Android: opens the
   camera inside the app, runs inference roughly every 1.5 seconds, and
@@ -332,12 +332,18 @@ The running app only needs three files, declared as assets in
 `class_names.txt`, and `rejection_config.json`. Everything below is tooling
 that *produces* those files; none of it ships in the app.
 
-- **`train_model_internet.py`**: the current training recipe. Transfer-learns
-  an `EfficientNetB0` (ImageNet weights) with a small classification head,
-  reading from `dataset/train` / `dataset/val`.
-- **`train_model.py`**: an older, simpler standalone CNN recipe (no
-  pretrained weights). Kept for reference; not what produced the current
-  bundled model.
+- **`train_model.py`**: the simple standalone CNN (3 Conv2D/MaxPool blocks,
+  Dense 128, no pretrained weights). The bundled model uses this same
+  architecture (verified by inspecting the `.tflite`), trained on the
+  3 maturity classes in `images/`.
+- **`train_model_internet.py`**: an alternative recipe that transfer-learns
+  `EfficientNetB0` (ImageNet weights). Not what produced the bundled model.
+- **`train_and_evaluate.py`**: trains the same CNN on a de-duplicated
+  70/15/15 train/val/test split of `images/` and writes accuracy,
+  precision, recall, F1 and a confusion matrix to `evaluation/`. Note that
+  `images/` stores each photo ~4 times as identical files, and the
+  `*-untrained` folders are mostly copies of the training images, so they
+  are not a valid test set on their own.
 - **`convert_to_tflite.py`**: converts a saved `.h5` Keras model to
   `.tflite` without re-running training.
 

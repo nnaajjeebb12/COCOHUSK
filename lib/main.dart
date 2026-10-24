@@ -8,6 +8,9 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app_logger.dart';
+import 'decision_reference.dart';
+import 'history_store.dart';
+import 'history_trends_view.dart';
 import 'inference_engine.dart';
 import 'live_camera_page.dart';
 import 'log_page.dart';
@@ -135,27 +138,21 @@ class _HuskTechAppState extends State<HuskTechApp> {
   }
 }
 
-class HistoryItem {
-  final String imagePath;
-  final PredictionResult prediction;
-  final DateTime timestamp;
-
-  HistoryItem({
-    required this.imagePath,
-    required this.prediction,
-    required this.timestamp,
-  });
-}
-
 class BatchItem {
   final String imagePath;
   final String predictedClass;
   final double confidence;
 
+  /// Why this one was rejected, or null when it was accepted. Without it a
+  /// batch of photos that are not coconut husks is just a list of the word
+  /// "Rejected" with no way to tell why any of them failed.
+  final String? rejectionReason;
+
   BatchItem({
     required this.imagePath,
     required this.predictedClass,
     required this.confidence,
+    this.rejectionReason,
   });
 }
 
@@ -188,13 +185,19 @@ class _HomePageState extends State<HomePage> {
   String _loadPhase = 'Loading model...';
   double? _loadFraction;
 
-  final List<HistoryItem> _history = [];
   final List<BatchItem> _batchResults = [];
+
+  // Shown low-key in the About dialog, see DeviceId's doc comment for why
+  // this exists at all given the app has no server or sync.
+  String? _deviceId;
 
   @override
   void initState() {
     super.initState();
     _loadEngine();
+    DeviceId.get().then((id) {
+      if (mounted) setState(() => _deviceId = id);
+    });
   }
 
   Future<void> _loadEngine() async {
@@ -446,12 +449,9 @@ class _HomePageState extends State<HomePage> {
       final path =
           '${dir.path}/capture_${DateTime.now().millisecondsSinceEpoch}.jpg';
       final f = await File(path).writeAsBytes(captured.bytes, flush: true);
-      _history.add(
-        HistoryItem(
-          imagePath: f.path,
-          prediction: captured.prediction,
-          timestamp: DateTime.now(),
-        ),
+      await HistoryStore.instance.insert(
+        imagePath: f.path,
+        prediction: captured.prediction,
       );
       if (!mounted) return;
       setState(() {
@@ -520,12 +520,9 @@ class _HomePageState extends State<HomePage> {
             imagePath: f.path,
             predictedClass: p.predictedClass,
             confidence: p.confidence,
+            rejectionReason: p.rejectionReason,
           ));
-          _history.add(HistoryItem(
-            imagePath: f.path,
-            prediction: p,
-            timestamp: DateTime.now(),
-          ));
+          await HistoryStore.instance.insert(imagePath: f.path, prediction: p);
         }
       }
 
@@ -573,11 +570,10 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
-    _history.add(HistoryItem(
+    await HistoryStore.instance.insert(
       imagePath: _selectedImage!.path,
       prediction: result,
-      timestamp: DateTime.now(),
-    ));
+    );
 
     setState(() {
       _prediction = result;
@@ -639,7 +635,7 @@ class _HomePageState extends State<HomePage> {
             onPressed: () {
               Navigator.of(context).push(
                 MaterialPageRoute(
-                  builder: (_) => HistoryPage(history: _history),
+                  builder: (_) => const HistoryPage(),
                 ),
               );
             },
@@ -698,8 +694,8 @@ class _HomePageState extends State<HomePage> {
                             const SizedBox(width: 48, height: 48),
                       ),
                     ),
-                    children: const [
-                      Card(
+                    children: [
+                      const Card(
                         child: Padding(
                           padding: EdgeInsets.all(12),
                           child: Text(
@@ -709,6 +705,20 @@ class _HomePageState extends State<HomePage> {
                           ),
                         ),
                       ),
+                      if (_deviceId != null)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            'Device ID: $_deviceId',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withValues(alpha: 0.5),
+                            ),
+                          ),
+                        ),
                     ],
                   );
                   break;
@@ -975,9 +985,27 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
             Text(
-              'Min confidence: ${(_engine.confThreshold * 100).round()}%'
+              'Min husk check: ${(_engine.huskThreshold * 100).round()}%'
+              ' • Min confidence: ${(_engine.confThreshold * 100).round()}%'
               ' • Min margin: ${(_engine.marginThreshold * 100).round()}%',
               style: theme.textTheme.bodySmall?.copyWith(color: mutedColor),
+            ),
+            const SizedBox(height: 2),
+            InkWell(
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const InfoPage()),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  'What do these thresholds mean?',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.primary,
+                    decoration: TextDecoration.underline,
+                  ),
+                ),
+              ),
             ),
           ],
         ),
@@ -1129,6 +1157,70 @@ class _HomePageState extends State<HomePage> {
         ),
         const SizedBox(height: 8),
         Text(p.explanation, style: const TextStyle(fontSize: 13)),
+        if (p.useCases != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            p.useCases!,
+            style: TextStyle(
+              fontSize: 12,
+              fontStyle: FontStyle.italic,
+              color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.65),
+            ),
+          ),
+        ],
+        // A rejected scan used to explain itself only in History, which left
+        // the screen the user is actually looking at saying "Rejected" with
+        // no reason. Both the reason and the numbers behind it belong here.
+        if (p.rejectionReason != null) ...[
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.error.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.info_outline,
+                        size: 16, color: Theme.of(context).colorScheme.error),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'Why was this rejected?',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(p.rejectionReason!, style: const TextStyle(fontSize: 13)),
+                if (p.rawPredictedClass != p.predictedClass) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    'Closest match before rejection: '
+                    '${formatClassName(p.rawPredictedClass)}',
+                    style: const TextStyle(
+                        fontSize: 12, fontStyle: FontStyle.italic),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+        if (p.hasThresholdReference) ...[
+          const SizedBox(height: 16),
+          const Divider(height: 1),
+          const SizedBox(height: 12),
+          DecisionReference(prediction: p, showHuskCues: false),
+        ],
       ],
     );
   }
@@ -1614,63 +1706,124 @@ class ModelUploadGuidePage extends StatelessWidget {
 }
 
 /// ===== HISTORY PAGE =====
-class HistoryPage extends StatelessWidget {
-  final List<HistoryItem> history;
-  const HistoryPage({super.key, required this.history});
+/// History is backed by [HistoryStore] (a persistent local SQLite database),
+/// not an in-memory list, so it survives app restarts. Two tabs: the
+/// per-entry log (as before), and a Day/Week/Month/Year trends chart.
+class HistoryPage extends StatefulWidget {
+  const HistoryPage({super.key});
+
+  @override
+  State<HistoryPage> createState() => _HistoryPageState();
+}
+
+class _HistoryPageState extends State<HistoryPage> {
+  late Future<List<HistoryItem>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = HistoryStore.instance.fetchAll();
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _future = HistoryStore.instance.fetchAll());
+    await _future;
+  }
 
   @override
   Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('History'),
+          bottom: const TabBar(
+            tabs: [
+              Tab(text: 'Log'),
+              Tab(icon: Icon(Icons.show_chart), text: 'Trends'),
+            ],
+          ),
+        ),
+        body: TabBarView(
+          children: [
+            _buildLog(context),
+            const HistoryTrendsView(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLog(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(title: const Text('History')),
-      body: history.isEmpty
-          ? const Center(child: Text('No history yet.'))
-          : ListView.builder(
-              padding: const EdgeInsets.all(12),
-              itemCount: history.length,
-              itemBuilder: (context, index) {
-                final item = history[index];
-                final badgeColor = classBadgeColor(
-                  item.prediction.predictedClass,
-                  colorScheme.primary,
-                );
-                return Card(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  child: ListTile(
-                    onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => HistoryDetailPage(item: item),
-                      ),
+    return RefreshIndicator(
+      onRefresh: _refresh,
+      child: FutureBuilder<List<HistoryItem>>(
+        future: _future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final history = snapshot.data ?? const [];
+          if (history.isEmpty) {
+            return LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                  child: const Center(child: Text('No history yet.')),
+                ),
+              ),
+            );
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: history.length,
+            itemBuilder: (context, index) {
+              final item = history[index];
+              final badgeColor = classBadgeColor(
+                item.prediction.predictedClass,
+                colorScheme.primary,
+              );
+              return Card(
+                margin: const EdgeInsets.only(bottom: 10),
+                child: ListTile(
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => HistoryDetailPage(item: item),
                     ),
-                    leading: ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: Image.file(
-                        File(item.imagePath),
-                        width: 48,
-                        height: 48,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) =>
-                            const Icon(Icons.broken_image, size: 32),
-                      ),
-                    ),
-                    title: Text(
-                      formatClassName(item.prediction.predictedClass),
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                        color: badgeColor,
-                      ),
-                    ),
-                    subtitle: Text(
-                      'Confidence: '
-                      '${(item.prediction.confidence * 100).toStringAsFixed(1)}%\n'
-                      '${item.timestamp}',
-                    ),
-                    isThreeLine: true,
-                    trailing: const Icon(Icons.chevron_right),
                   ),
-                );
-              },
-            ),
+                  leading: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.file(
+                      File(item.imagePath),
+                      width: 48,
+                      height: 48,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.broken_image, size: 32),
+                    ),
+                  ),
+                  title: Text(
+                    formatClassName(item.prediction.predictedClass),
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: badgeColor,
+                    ),
+                  ),
+                  subtitle: Text(
+                    'Confidence: '
+                    '${(item.prediction.confidence * 100).toStringAsFixed(1)}%\n'
+                    '${item.timestamp}',
+                  ),
+                  isThreeLine: true,
+                  trailing: const Icon(Icons.chevron_right),
+                ),
+              );
+            },
+          );
+        },
+      ),
     );
   }
 }
@@ -1744,6 +1897,15 @@ class HistoryDetailPage extends StatelessWidget {
                   Text('${item.timestamp}', style: theme.textTheme.bodySmall),
                   const SizedBox(height: 12),
                   Text(p.explanation, style: theme.textTheme.bodyMedium),
+                  if (p.useCases != null) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      p.useCases!,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1787,6 +1949,15 @@ class HistoryDetailPage extends StatelessWidget {
                     ],
                   ],
                 ),
+              ),
+            ),
+          ],
+          if (p.hasThresholdReference) ...[
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: DecisionReference(prediction: p),
               ),
             ),
           ],
@@ -1908,7 +2079,12 @@ class BatchPage extends StatelessWidget {
                     title: Text(readableClass,
                         style: TextStyle(
                             fontWeight: FontWeight.w600, color: badgeColor)),
-                    subtitle: Text('Confidence: $pct%'),
+                    subtitle: Text(
+                      item.rejectionReason ?? 'Confidence: $pct%',
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    isThreeLine: item.rejectionReason != null,
                   ),
                 );
               },
@@ -1941,6 +2117,7 @@ class InfoPage extends StatelessWidget {
               'Husk has not fully developed yet',
               'Fibers are underdeveloped and moisture content is high',
               'Best left to mature further before harvesting/processing',
+              'Best for: coco peat, coir fiber, mulch, compost, soil conditioner',
             ],
           ),
           _gradeCard(
@@ -1952,6 +2129,7 @@ class InfoPage extends StatelessWidget {
               'Fully developed, high-quality fibers',
               'Ideal moisture content',
               'The ideal harvest stage for top processing quality',
+              'Best for: coir fiber, coco peat, rope/twine, doormats, floor mats',
             ],
           ),
           _gradeCard(
@@ -1963,6 +2141,7 @@ class InfoPage extends StatelessWidget {
               'Husk has aged past its ideal stage',
               'Fibers may be dry or degraded',
               'Reduced processing quality',
+              'Best for: coir fiber, coco peat, rope/twine, doormats, floor mats',
             ],
           ),
           _gradeCard(
@@ -1971,11 +2150,193 @@ class InfoPage extends StatelessWidget {
             icon: Icons.block,
             title: 'Rejected',
             lines: const [
-              'The image does not resemble a coconut husk, or quality is too low.',
-              'Please recapture on a plain background with clear visibility.',
+              'Anything that is not a coconut husk is rejected rather than '
+                  'given a maturity stage.',
+              'A husk photo is also rejected when it is too blurry, too '
+                  'dark, or the model could not clearly tell two stages '
+                  'apart.',
+              'Please recapture one husk on a plain background with clear '
+                  'visibility.',
+              'Each rejected scan says which check it failed, under '
+                  '"Decision reference".',
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text('How a result is decided', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Text(
+              'Every scan has to pass three checks before a maturity stage '
+              'is reported. Failing any one of them is reported as '
+              '"Rejected". Each scan shows its own measured values against '
+              'these thresholds under "Decision reference".',
+              style: theme.textTheme.bodyMedium,
+            ),
+          ),
+          _gradeCard(
+            theme,
+            color: theme.colorScheme.primary,
+            icon: Icons.spa_outlined,
+            title: '1. Husk check - is this a coconut husk at all?',
+            lines: const [
+              'Looks at the photo itself, not at the model\'s answer: husk '
+                  'colour, fibre detail, colours a husk never has, and '
+                  'whether a husk-coloured object stands out from its '
+                  'background.',
+              'This is the check that rejects photos of anything that is '
+                  'not a coconut husk. The maturity model only knows three '
+                  'husk stages, so without this check it would answer a '
+                  'photo of a wall, a hand or the sky with a confident '
+                  'maturity stage anyway.',
+              'Scored 0-100%, taken as the weakest of the four cues above.',
+              'Scores below the minimum are rejected without reporting a '
+                  'stage.',
+            ],
+          ),
+          _gradeCard(
+            theme,
+            color: theme.colorScheme.primary,
+            icon: Icons.percent,
+            title: '2. Confidence - how sure is the model?',
+            lines: const [
+              'The probability the model gave to its top maturity stage.',
+              'Below the minimum, the stage is not reported.',
+            ],
+          ),
+          _gradeCard(
+            theme,
+            color: theme.colorScheme.primary,
+            icon: Icons.compare_arrows,
+            title: '3. Margin - how clear-cut was the choice?',
+            lines: const [
+              'The gap between the top stage and the runner-up.',
+              'A small gap means the model could not clearly tell two '
+                  'stages apart, so the result is rejected rather than '
+                  'guessed.',
+            ],
+          ),
+          _thresholdTable(theme),
+          const SizedBox(height: 8),
+          Text('Your data', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 12),
+          _gradeCard(
+            theme,
+            color: theme.colorScheme.primary,
+            icon: Icons.phonelink_lock,
+            title: 'Stored on this device only',
+            lines: const [
+              'Scan history, photos, and trends are saved in a local database '
+                  'on this device. Nothing is uploaded or shared.',
+              'Each device keeps its own history; another device cannot see '
+                  'yours.',
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  /// The reference table itself: what every position of the Strictness
+  /// slider actually sets each threshold to. Read straight off
+  /// [InferenceEngine.thresholdsAt], so the table cannot drift away from the
+  /// values the engine really applies.
+  Widget _thresholdTable(ThemeData theme) {
+    const presets = <(String, double)>[
+      ('Very Lenient', 0.0),
+      ('Lenient', 0.3),
+      ('Balanced (default)', 0.5),
+      ('Strict', 0.7),
+      ('Very Strict', 1.0),
+    ];
+    final muted = theme.colorScheme.onSurface.withValues(alpha: 0.6);
+    final headerStyle =
+        theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w700);
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.tune, size: 20, color: theme.colorScheme.primary),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Threshold reference',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'What the Strictness slider on the main screen sets each '
+              'minimum to. It starts at Balanced every time the app opens.',
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 12),
+            Table(
+              columnWidths: const {
+                0: FlexColumnWidth(2.4),
+                1: FlexColumnWidth(1),
+                2: FlexColumnWidth(1),
+                3: FlexColumnWidth(1),
+              },
+              children: [
+                TableRow(
+                  children: [
+                    Text('Strictness', style: headerStyle),
+                    Text('Husk', textAlign: TextAlign.right, style: headerStyle),
+                    Text('Conf.', textAlign: TextAlign.right, style: headerStyle),
+                    Text('Margin',
+                        textAlign: TextAlign.right, style: headerStyle),
+                  ],
+                ),
+                for (final (label, value) in presets)
+                  TableRow(
+                    children: () {
+                      final t = InferenceEngine.thresholdsAt(value);
+                      final cell = theme.textTheme.bodySmall;
+                      return [
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(label, style: cell),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text('${(t.husk * 100).round()}%',
+                              textAlign: TextAlign.right, style: cell),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text('${(t.confidence * 100).round()}%',
+                              textAlign: TextAlign.right, style: cell),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text('${(t.margin * 100).round()}%',
+                              textAlign: TextAlign.right, style: cell),
+                        ),
+                      ];
+                    }(),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'A saved scan keeps the thresholds it was judged by, so moving '
+              'the slider never changes a result already in History.',
+              style: theme.textTheme.bodySmall?.copyWith(color: muted),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1995,12 +2356,21 @@ class InfoPage extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(icon, size: 20, color: color),
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Icon(icon, size: 20, color: color),
+                ),
                 const SizedBox(width: 8),
-                Text(title,
-                    style: theme.textTheme.titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w700, color: color)),
+                // Wraps rather than overflows: these titles are full
+                // sentences now, and a narrow phone has nowhere to put them
+                // on one line.
+                Expanded(
+                  child: Text(title,
+                      style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700, color: color)),
+                ),
               ],
             ),
             const SizedBox(height: 6),
@@ -2035,11 +2405,18 @@ class ManualPage extends StatelessWidget {
         'and tap "Capture" when the stage looks correct.',
     '"Gallery" lets you pick an existing photo. "Batch (Gallery)" analyzes '
         'many photos at once.',
-    'Review the predicted maturity level and confidence. If the result is '
-        '"Rejected", recapture a clearer husk image.',
+    'Review the predicted maturity level and confidence. Photographing '
+        'anything that is not a coconut husk returns "Rejected" instead of '
+        'a maturity stage.',
+    'If the result is "Rejected", the card says which check failed and by '
+        'how much under "Decision reference" - recapture a clearer husk '
+        'image, or see the Information page for what each threshold means.',
     'Use the Information page to understand the meaning of each maturity '
         'level.',
-    'You can review previous scans in the History section.',
+    'Tap the History icon to review previous scans. The "Log" tab lists '
+        'every scan with its photo and result; the "Trends" tab charts how '
+        'many of each stage were scanned per Day, Week, Month, or Year, with '
+        'totals underneath. History is stored only on this device.',
     'To use a different model, open the menu and choose "Model Settings" '
         'to load a .tflite file from storage. See "Custom Model Guide" for '
         'the file format the app expects.',

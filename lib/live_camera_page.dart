@@ -328,9 +328,22 @@ class _LiveCameraPageState extends State<LiveCameraPage>
     Color badgeColor = Colors.grey;
 
     if (r != null) {
-      headline = '${_formatClass(r.predictedClass)} '
-          '(${(r.confidence * 100).toStringAsFixed(1)}%)';
-      sub = r.explanation;
+      if (r.rejectedBy == RejectionCheck.notHusk) {
+        // The verdict stays "Rejected", the same word every other screen
+        // uses. The confidence percentage is dropped from it, though: it is
+        // the model's confidence in a maturity stage that was never
+        // reported, so printing "Rejected (100.0%)" reads as certainty in
+        // the rejection itself. The reason goes underneath instead.
+        headline = 'Rejected';
+        sub = r.rejectionReason ?? r.explanation;
+      } else if (r.rejectionReason != null) {
+        headline = _formatClass(r.predictedClass);
+        sub = r.rejectionReason!;
+      } else {
+        headline = '${_formatClass(r.predictedClass)} '
+            '(${(r.confidence * 100).toStringAsFixed(1)}%)';
+        sub = r.explanation;
+      }
       badgeColor = _colorFor(r.predictedClass);
     }
 
