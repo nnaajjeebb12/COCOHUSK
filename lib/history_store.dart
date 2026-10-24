@@ -12,7 +12,10 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:uuid/uuid.dart';
 
 import 'app_logger.dart';
+<<<<<<< HEAD
 import 'husk_gate.dart';
+=======
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
 import 'inference_engine.dart';
 
 /// One saved prediction, as shown in the History list and detail pages.
@@ -120,6 +123,7 @@ class HistoryStore {
 
     _db = await openDatabase(
       path,
+<<<<<<< HEAD
       version: 2,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -139,6 +143,9 @@ class HistoryStore {
           }
         }
       },
+=======
+      version: 1,
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE predictions (
@@ -153,12 +160,16 @@ class HistoryStore {
             explanation TEXT NOT NULL,
             use_cases TEXT,
             rejection_reason TEXT,
+<<<<<<< HEAD
             class_probabilities TEXT NOT NULL,
             conf_threshold REAL,
             margin_threshold REAL,
             husk_threshold REAL,
             husk_features TEXT,
             rejected_by TEXT
+=======
+            class_probabilities TEXT NOT NULL
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
           )
         ''');
         await db.execute(
@@ -189,6 +200,7 @@ class HistoryStore {
         'use_cases': prediction.useCases,
         'rejection_reason': prediction.rejectionReason,
         'class_probabilities': jsonEncode(prediction.classProbabilities),
+<<<<<<< HEAD
         'conf_threshold': prediction.confThresholdUsed,
         'margin_threshold': prediction.marginThresholdUsed,
         'husk_threshold': prediction.huskThresholdUsed,
@@ -196,6 +208,8 @@ class HistoryStore {
             ? null
             : jsonEncode(prediction.huskFeatures!.toJson()),
         'rejected_by': prediction.rejectedBy.name,
+=======
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
       });
     } catch (e, st) {
       // A failed history write should never block or crash the actual
@@ -223,6 +237,7 @@ class HistoryStore {
         rawPredictedClass: row['raw_predicted_class'] as String,
         margin: row['margin'] as double,
         rejectionReason: row['rejection_reason'] as String?,
+<<<<<<< HEAD
         huskFeatures: HuskFeatures.fromJson(row['husk_features'] as String?),
         // Null for rows written before schema v2; PredictionResult treats a
         // zero threshold as "no reference recorded" and the UI hides the
@@ -232,10 +247,13 @@ class HistoryStore {
             (row['margin_threshold'] as num?)?.toDouble() ?? 0.0,
         huskThresholdUsed: (row['husk_threshold'] as num?)?.toDouble() ?? 0.0,
         rejectedBy: _rejectionCheckFrom(row['rejected_by'] as String?),
+=======
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
       ),
     );
   }
 
+<<<<<<< HEAD
   static RejectionCheck _rejectionCheckFrom(String? name) {
     if (name == null) return RejectionCheck.none;
     for (final value in RejectionCheck.values) {
@@ -244,6 +262,8 @@ class HistoryStore {
     return RejectionCheck.none;
   }
 
+=======
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
   /// All of this device's history, most recent first.
   Future<List<HistoryItem>> fetchAll({int? limit}) async {
     try {

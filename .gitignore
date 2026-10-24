@@ -67,6 +67,7 @@ __pycache__/
 # not publish. Replace with real, reviewed training data before ever
 # tracking this folder.
 /dataset/
+/evaluation/
 
 # Real training photos (immature/mature/overmature) plus their source .zip
 # downloads - 3.8GB total, including three individual 500-700MB zips that
@@ -88,4 +89,3 @@ __pycache__/
 /class_names.txt
 /class_names_working.txt
 /rejection_config.json
-/evaluation/

@@ -8,7 +8,10 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app_logger.dart';
+<<<<<<< HEAD
 import 'decision_reference.dart';
+=======
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
 import 'history_store.dart';
 import 'history_trends_view.dart';
 import 'inference_engine.dart';
@@ -1168,6 +1171,7 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
         ],
+<<<<<<< HEAD
         // A rejected scan used to explain itself only in History, which left
         // the screen the user is actually looking at saying "Rejected" with
         // no reason. Both the reason and the numbers behind it belong here.
@@ -1221,6 +1225,8 @@ class _HomePageState extends State<HomePage> {
           const SizedBox(height: 12),
           DecisionReference(prediction: p, showHuskCues: false),
         ],
+=======
+>>>>>>> c333cfb34d9fc5fdb6b47bfdb07cc29709871eeb
       ],
     );
   }
@@ -2217,6 +2223,21 @@ class InfoPage extends StatelessWidget {
             ],
           ),
           _thresholdTable(theme),
+          const SizedBox(height: 8),
+          Text('Your data', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 12),
+          _gradeCard(
+            theme,
+            color: theme.colorScheme.primary,
+            icon: Icons.phonelink_lock,
+            title: 'Stored on this device only',
+            lines: const [
+              'Scan history, photos, and trends are saved in a local database '
+                  'on this device. Nothing is uploaded or shared.',
+              'Each device keeps its own history; another device cannot see '
+                  'yours.',
+            ],
+          ),
           const SizedBox(height: 8),
           Text('Your data', style: theme.textTheme.titleMedium),
           const SizedBox(height: 12),
